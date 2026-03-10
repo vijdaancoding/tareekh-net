@@ -209,3 +209,5 @@ __marimo__/
 # Custom
 .claude/
 
+# Frontend
+frontend/node_modules
