@@ -21,4 +21,7 @@ dependencies = [
     "urllib3<2.6",
     "chardet<7",
     "charset-normalizer<4",
+    "ragas>=0.2.0",
+    "datasets>=2.14.0",
+    "pandas>=2.0.0",
 ]

@@ -2,11 +2,13 @@ import { useState, useEffect, useCallback } from 'react'
 import GraphView from './components/GraphView.jsx'
 import ChatPanel from './components/ChatPanel.jsx'
 import PendingPanel from './components/PendingPanel.jsx'
+import EvalPanel from './components/EvalPanel.jsx'
 
 export default function App() {
   const [graphData, setGraphData] = useState({ nodes: [], links: [] })
   const [chatOpen, setChatOpen] = useState(true)
   const [pendingOpen, setPendingOpen] = useState(false)
+  const [evalOpen, setEvalOpen] = useState(false)
   const [pendingCount, setPendingCount] = useState(0)
   const [selectedNode, setSelectedNode] = useState(null)
 
@@ -52,11 +54,14 @@ export default function App() {
         </span>
         <span style={{ color: '#666', fontSize: '13px' }}>Pakistani Politicians Knowledge Graph</span>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: '10px' }}>
-          <button onClick={() => { setPendingOpen(o => !o); setChatOpen(false) }} style={btnStyle(pendingOpen)}>
+          <button onClick={() => { setPendingOpen(o => !o); setChatOpen(false); setEvalOpen(false) }} style={btnStyle(pendingOpen)}>
             Approvals {pendingCount > 0 && <span style={{ background: '#ef4444', borderRadius: '50%', padding: '1px 6px', fontSize: '11px', marginLeft: '4px' }}>{pendingCount}</span>}
           </button>
-          <button onClick={() => { setChatOpen(o => !o); setPendingOpen(false) }} style={btnStyle(chatOpen)}>
+          <button onClick={() => { setChatOpen(o => !o); setPendingOpen(false); setEvalOpen(false) }} style={btnStyle(chatOpen)}>
             Chat
+          </button>
+          <button onClick={() => { setEvalOpen(o => !o); setChatOpen(false); setPendingOpen(false) }} style={btnStyle(evalOpen)}>
+            Eval
           </button>
           <button onClick={fetchGraph} style={btnStyle(false)}>
             ↻ Refresh
@@ -104,6 +109,11 @@ export default function App() {
           onClose={() => setPendingOpen(false)}
           onApproved={() => { fetchGraph(); fetchPendingCount() }}
         />
+      )}
+
+      {/* Eval panel */}
+      {evalOpen && (
+        <EvalPanel onClose={() => setEvalOpen(false)} />
       )}
     </div>
   )

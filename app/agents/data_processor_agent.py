@@ -1,9 +1,11 @@
 import json
+import re
 import uuid
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.agents.state import AgentState
 from app.services.embedding_service import embedding_service
+from app.utils import strip_code_fence
 from app.config import settings
 
 EXTRACTION_SYSTEM_PROMPT = """You are a data extraction expert specializing in Pakistani politics.
@@ -32,8 +34,6 @@ _RELEVANT_SECTIONS = {
 
 
 def _chunk_markdown(markdown: str, max_chars: int = 3000) -> list[str]:
-    """Split markdown on ## headers, then merge small chunks up to max_chars."""
-    import re
     sections = re.split(r"(?m)^(#{1,3} .+)$", markdown)
     chunks: list[str] = []
     current = ""
@@ -50,8 +50,6 @@ def _chunk_markdown(markdown: str, max_chars: int = 3000) -> list[str]:
 
 
 def _select_chunks(chunks: list[str], max_total: int = 8000) -> str:
-    """Prefer chunks whose headings match relevant political/bio keywords."""
-    import re
     priority: list[str] = []
     fallback: list[str] = []
     for chunk in chunks:
@@ -67,7 +65,6 @@ def _select_chunks(chunks: list[str], max_total: int = 8000) -> str:
         remaining = max_total - len(selected)
         if remaining <= 0:
             break
-        # Fill up to max_total, truncating the last chunk if needed
         selected += "\n\n" + chunk[:remaining]
     return selected.strip()
 
@@ -81,7 +78,6 @@ async def data_processor_node(state: AgentState) -> dict:
         _log("ERROR: No scraped sources available")
         return {"error": "No scraped sources available", "extracted_entities": None}
 
-    # Build chunked, section-aware content from each source
     _log(f"Chunking {len(state['scraped_sources'])} source(s)...")
     combined_content = ""
     for source in state["scraped_sources"]:
@@ -90,24 +86,18 @@ async def data_processor_node(state: AgentState) -> dict:
         combined_content += f"\n\n=== Source: {source['title']} ===\n{selected}"
         _log(f"  '{source['title']}': {len(chunks)} chunks → {len(selected):,} chars selected")
 
-    combined_content = combined_content[:15000]  # Hard safety cap
+    combined_content = combined_content[:15000]
     _log(f"Total content sent to LLM: {len(combined_content):,} chars")
 
     _log("Calling Gemini to extract entities...")
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=settings.google_api_key)
-
     response = await llm.ainvoke([
         SystemMessage(content=EXTRACTION_SYSTEM_PROMPT),
-        HumanMessage(content=f"Extract politician data from:\n{combined_content}")
+        HumanMessage(content=f"Extract politician data from the following scraped content:\n<SCRAPED_CONTENT>\n{combined_content}\n</SCRAPED_CONTENT>")
     ])
 
     try:
-        raw = response.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        data = json.loads(raw.strip())
+        data = json.loads(strip_code_fence(response.content))
     except Exception as e:
         _log(f"ERROR: LLM extraction failed: {e}\nRaw response: {response.content[:200]}")
         return {"error": f"LLM extraction failed: {e}", "extracted_entities": None}
@@ -115,13 +105,24 @@ async def data_processor_node(state: AgentState) -> dict:
     _log(f"Extracted: name='{data.get('name')}', born='{data.get('born')}', "
          f"{len(data.get('parties', []))} party(ies), {len(data.get('positions', []))} position(s)")
 
-    # Generate embedding for the bio
     bio = data.get("bio", "")
-    embedding = []
+
+    # Build a richer text for embedding: name + bio + party/position context
+    parties_str = ", ".join(p["name"] for p in data.get("parties", []))
+    positions_str = ", ".join(p["title"] for p in data.get("positions", []))
+    embed_text = data.get("name", "")
     if bio:
-        _log("Generating Gemini embedding for bio...")
+        embed_text += f". {bio}"
+    if parties_str:
+        embed_text += f" Parties: {parties_str}."
+    if positions_str:
+        embed_text += f" Positions: {positions_str}."
+
+    embedding: list[float] = []
+    if embed_text:
+        _log("Generating Gemini embedding...")
         try:
-            embedding = await embedding_service.embed_text(bio)
+            embedding = await embedding_service.embed_document(embed_text)
             _log(f"Embedding generated ({len(embedding)}-dim)")
         except Exception as e:
             _log(f"ERROR: Embedding failed: {e}")
@@ -139,7 +140,6 @@ async def data_processor_node(state: AgentState) -> dict:
         "source_url": state["scraped_sources"][0]["url"],
     }
 
-    # Build parameterized Cypher MERGE query
     _log("Building Cypher MERGE query...")
     cypher_query = _build_cypher(entities)
     cypher_params = _build_params(entities)
@@ -154,6 +154,8 @@ async def data_processor_node(state: AgentState) -> dict:
 
 
 def _build_cypher(entities: dict) -> str:
+    # Only politician + source nodes; parties/positions are written separately
+    # in execute_write_node to avoid empty-UNWIND dropping all rows.
     return """
 MERGE (p:Politician {id: $politician_id})
 SET p.name = $name,
@@ -164,37 +166,14 @@ SET p.name = $name,
 MERGE (src:Source {url: $source_url})
 SET src.id = $source_id,
     src.scraped_at = datetime()
-
 MERGE (p)-[:SOURCED_FROM]->(src)
-
-WITH p
-UNWIND $parties AS party_data
-MERGE (party:Party {id: party_data.id})
-SET party.name = party_data.name,
-    party.abbreviation = party_data.abbreviation
-MERGE (p)-[mem:MEMBER_OF]->(party)
-SET mem.from_date = party_data.from_date,
-    mem.to_date = party_data.to_date,
-    mem.role = party_data.role
-
-WITH p
-UNWIND $positions AS pos_data
-MERGE (pos:Position {id: pos_data.id})
-SET pos.title = pos_data.title,
-    pos.level = pos_data.level,
-    pos.branch = pos_data.branch
-MERGE (p)-[held:HELD_POSITION]->(pos)
-SET held.from_date = pos_data.from_date,
-    held.to_date = pos_data.to_date,
-    held.constituency = pos_data.constituency
 """
 
 
 def _build_params(entities: dict) -> dict:
-    import uuid as uuid_mod
     parties = [
         {
-            "id": str(uuid_mod.uuid5(uuid_mod.NAMESPACE_DNS, p["name"])),
+            "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, p["name"])),
             "name": p["name"],
             "abbreviation": p.get("abbreviation", ""),
             "from_date": p.get("from_date"),
@@ -205,7 +184,7 @@ def _build_params(entities: dict) -> dict:
     ]
     positions = [
         {
-            "id": str(uuid_mod.uuid5(uuid_mod.NAMESPACE_DNS, pos["title"] + entities["politician_id"])),
+            "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, pos["title"] + entities["politician_id"])),
             "title": pos["title"],
             "level": pos.get("level", "federal"),
             "branch": pos.get("branch", "executive"),
@@ -222,7 +201,7 @@ def _build_params(entities: dict) -> dict:
         "bio": entities["bio"],
         "embedding": entities["embedding"],
         "source_url": entities["source_url"],
-        "source_id": str(uuid_mod.uuid5(uuid_mod.NAMESPACE_DNS, entities["source_url"])),
+        "source_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, entities["source_url"])),
         "parties": parties,
         "positions": positions,
     }

@@ -1,6 +1,5 @@
 import uuid
-import asyncio
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks
 from pydantic import BaseModel
 from app.agents.graph import ingestion_graph
 
@@ -49,5 +48,5 @@ async def ingest(request: IngestRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(run_ingestion, thread_id, request.url)
     return IngestResponse(
         thread_id=thread_id,
-        message=f"Ingestion started. Use thread_id to track progress.",
+        message="Ingestion started. Use thread_id to track progress.",
     )

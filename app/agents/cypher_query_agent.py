@@ -1,3 +1,4 @@
+import re
 import json
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -5,6 +6,7 @@ from app.agents.state import AgentState
 from app.services.embedding_service import embedding_service
 from app.db.queries import semantic_search
 from app.db.neo4j_client import get_driver
+from app.utils import strip_code_fence
 from app.config import settings
 
 SCHEMA_SYSTEM_PROMPT = """You are a Neo4j Cypher expert. Generate READ-ONLY Cypher queries for a Pakistani politicians database.
@@ -24,7 +26,26 @@ Relationships:
 - (Politician)-[:RELATED_TO]->(Politician)
 - (Politician)-[:SOURCED_FROM]->(Source)
 
+Rules:
+- Never generate MERGE, CREATE, DELETE, DETACH, REMOVE, SET, DROP, or any write clause.
+- If the question cannot be answered with a read-only query, return: MATCH (p:Politician) RETURN p LIMIT 0
+
 Return ONLY the Cypher query, no explanation."""
+
+FORMAT_SYSTEM_PROMPT = """You are a helpful assistant for a Pakistani politicians knowledge base.
+Answer ONLY using the database results provided to you.
+If the results are empty, say no information was found.
+If the question is outside the scope of Pakistani politics or politicians, say so clearly.
+Do not fabricate, infer, or add information beyond what is in the results."""
+
+_WRITE_PATTERN = re.compile(
+    r"\b(MERGE|CREATE|DELETE|DETACH|REMOVE|SET|DROP)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_read_only(cypher: str) -> bool:
+    return not _WRITE_PATTERN.search(cypher)
 
 
 async def cypher_query_node(state: AgentState) -> dict:
@@ -34,7 +55,7 @@ async def cypher_query_node(state: AgentState) -> dict:
 
     # Try semantic search first
     try:
-        embedding = await embedding_service.embed_text(query)
+        embedding = await embedding_service.embed_query(query)
         driver = await get_driver()
         results = await semantic_search(driver, embedding, top_k=5)
         if results:
@@ -49,12 +70,10 @@ async def cypher_query_node(state: AgentState) -> dict:
         HumanMessage(content=f"Generate a Cypher query for: {query}")
     ])
 
-    cypher = response.content.strip()
-    if cypher.startswith("```"):
-        cypher = cypher.split("```")[1]
-        if cypher.startswith("cypher"):
-            cypher = cypher[6:]
-        cypher = cypher.strip()
+    cypher = strip_code_fence(response.content)
+
+    if not _is_read_only(cypher):
+        return {"query_results": [], "error": "Generated query was not read-only and was blocked"}
 
     try:
         driver = await get_driver()
@@ -75,7 +94,7 @@ async def format_results_node(state: AgentState) -> dict:
 
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=settings.google_api_key)
     response = await llm.ainvoke([
-        SystemMessage(content="You are a helpful assistant. Summarize the database results in a clear, concise answer."),
+        SystemMessage(content=FORMAT_SYSTEM_PROMPT),
         HumanMessage(content=f"Question: {query}\n\nDatabase results: {json.dumps(results, default=str)[:3000]}")
     ])
 

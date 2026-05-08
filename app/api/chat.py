@@ -1,7 +1,6 @@
 import uuid
-import asyncio
 from fastapi import APIRouter, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from app.agents.orchestrator_agent import classify_intent, find_wikipedia_url
 from app.agents.graph import ingestion_graph, query_graph
@@ -11,7 +10,7 @@ router = APIRouter()
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(max_length=2000)
     thread_id: Optional[str] = None
 
 
@@ -24,10 +23,9 @@ class ChatResponse(BaseModel):
     pending_jobs: list[dict] = []
 
 
-async def _run_ingestion(thread_id: str, url: str) -> None:
-    config = {"configurable": {"thread_id": thread_id}}
-    initial_state = {
-        "target_url": url, "query": None, "scraped_sources": [],
+def _make_initial_state(url: str = "", query: str = "") -> dict:
+    return {
+        "target_url": url, "query": query, "scraped_sources": [],
         "extracted_entities": None, "cypher_write_query": None,
         "cypher_write_params": None, "hitl_job_id": None,
         "hitl_decision": None, "hitl_feedback": None,
@@ -35,8 +33,12 @@ async def _run_ingestion(thread_id: str, url: str) -> None:
         "validation_passed": None, "validation_notes": None,
         "messages": [], "error": None, "retry_count": 0,
     }
+
+
+async def _run_ingestion(thread_id: str, url: str) -> None:
+    config = {"configurable": {"thread_id": thread_id}}
     try:
-        async for _ in ingestion_graph.astream(initial_state, config=config):
+        async for _ in ingestion_graph.astream(_make_initial_state(url=url), config=config):
             pass
     except Exception as e:
         print(f"  [CHAT] Ingestion error for thread {thread_id}: {e}", flush=True)
@@ -78,27 +80,11 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     # --- QUERY ---
     if intent == "query":
         question = classified.get("question") or request.message
-        config = {"configurable": {"thread_id": "chat-" + str(uuid.uuid4())[:8]}}
-        initial_state = {
-            "target_url": "", "query": question, "scraped_sources": [],
-            "extracted_entities": None, "cypher_write_query": None,
-            "cypher_write_params": None, "hitl_job_id": None,
-            "hitl_decision": None, "hitl_feedback": None,
-            "query_results": None, "final_answer": None,
-            "validation_passed": None, "validation_notes": None,
-            "messages": [], "error": None, "retry_count": 0,
-        }
-        final_state = None
-        async for state in query_graph.astream(initial_state, config=config):
-            final_state = state
-
-        answer = "No answer found."
-        results = []
-        if final_state:
-            last = list(final_state.values())[-1]
-            answer = last.get("final_answer") or "No answer found."
-            results = last.get("query_results") or []
-
+        config = {"configurable": {"thread_id": "chat-" + str(uuid.uuid4())}}
+        # ainvoke returns the full accumulated state — reliable for multi-node graphs
+        final_state = await query_graph.ainvoke(_make_initial_state(query=question), config=config)
+        answer = final_state.get("final_answer") or "No answer found."
+        results = final_state.get("query_results") or []
         return ChatResponse(reply=answer, intent=intent, query_results=results)
 
     # --- PENDING ---

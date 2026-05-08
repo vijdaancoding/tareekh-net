@@ -10,6 +10,34 @@ def _log(msg: str) -> None:
     print(f"  [CYPHER WRITE] {msg}", flush=True)
 
 
+# Separate queries for parties/positions so empty lists don't kill the transaction.
+# (UNWIND on an empty list drops all rows in a single-query chain.)
+_PARTIES_CYPHER = """
+MATCH (p:Politician {id: $politician_id})
+UNWIND $parties AS party_data
+MERGE (party:Party {id: party_data.id})
+SET party.name = party_data.name,
+    party.abbreviation = party_data.abbreviation
+MERGE (p)-[mem:MEMBER_OF]->(party)
+SET mem.from_date = party_data.from_date,
+    mem.to_date = party_data.to_date,
+    mem.role = party_data.role
+"""
+
+_POSITIONS_CYPHER = """
+MATCH (p:Politician {id: $politician_id})
+UNWIND $positions AS pos_data
+MERGE (pos:Position {id: pos_data.id})
+SET pos.title = pos_data.title,
+    pos.level = pos_data.level,
+    pos.branch = pos_data.branch
+MERGE (p)-[held:HELD_POSITION]->(pos)
+SET held.from_date = pos_data.from_date,
+    held.to_date = pos_data.to_date,
+    held.constituency = pos_data.constituency
+"""
+
+
 async def cypher_write_node(state: AgentState) -> dict:
     entities = state.get("extracted_entities", {})
     politician_name = entities.get("name", "Unknown") if entities else "Unknown"
@@ -19,7 +47,6 @@ async def cypher_write_node(state: AgentState) -> dict:
     config = get_config()
     thread_id = config.get("configurable", {}).get("thread_id", str(uuid.uuid4()))
 
-    # Create HITL job before interrupting
     job = hitl_store.create_job(
         thread_id=thread_id,
         politician_name=politician_name,
@@ -29,7 +56,6 @@ async def cypher_write_node(state: AgentState) -> dict:
     _log(f"HITL job created: job_id={job.job_id}, politician='{politician_name}'")
     _log("Waiting for human approval — call POST /api/v1/approve/{job_id} or /reject/{job_id}")
 
-    # Interrupt and wait for human decision
     decision = interrupt({
         "job_id": job.job_id,
         "politician_name": politician_name,
@@ -63,7 +89,13 @@ async def execute_write_node(state: AgentState) -> dict:
     try:
         driver = await get_driver()
         async with driver.session() as session:
-            await session.run(cypher_query, cypher_params)
+            async with await session.begin_transaction() as tx:
+                await tx.run(cypher_query, cypher_params)
+                if cypher_params.get("parties"):
+                    await tx.run(_PARTIES_CYPHER, cypher_params)
+                if cypher_params.get("positions"):
+                    await tx.run(_POSITIONS_CYPHER, cypher_params)
+                await tx.commit()
         _log(f"Successfully ingested '{name}' into Neo4j")
         return {"error": None, "final_answer": f"Successfully ingested politician: {name}"}
     except Exception as e:
