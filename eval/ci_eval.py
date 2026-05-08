@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-RAGAS CI evaluation script.
+RAGAS CI evaluation script (ragas >= 0.4 compatible).
 
-Scores a fixed set of mock pipeline responses using RAGAS metrics (faithfulness,
-answer_relevancy, context_precision). No running Neo4j instance is required —
-the responses are pre-built so only the GOOGLE_API_KEY env var is needed.
+Scores a fixed set of mock pipeline responses using RAGAS metrics. No running
+Neo4j instance is required — responses are pre-built. Only GOOGLE_API_KEY is
+needed.
 
 The test suite deliberately includes one bad answer that hallucinates facts and
-ignores the question entirely. This causes the aggregate faithfulness and
-answer_relevancy scores to drop below threshold, failing the evaluation.
+ignores the question entirely, causing aggregate faithfulness and answer_relevancy
+to drop below threshold and failing the evaluation.
 
 Exit codes
 ----------
@@ -19,19 +19,25 @@ Exit codes
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
 
 from datasets import Dataset
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from google import genai as google_genai
+from langchain_google_genai import ChatGoogleGenerativeAI
 from ragas import evaluate
-from ragas.embeddings import LangchainEmbeddingsWrapper
-from ragas.llms import LangchainLLMWrapper
-from ragas.metrics.collections import answer_relevancy, context_precision, faithfulness
+from ragas.embeddings import GoogleEmbeddings
+# Use the old-style Metric subclasses — ragas.evaluate() validates with
+# isinstance(m, ragas.metrics.base.Metric), which the ragas.metrics.collections
+# classes do NOT satisfy.
+from ragas.metrics._answer_relevance import AnswerRelevancy
+from ragas.metrics._context_precision import ContextPrecision
+from ragas.metrics._faithfulness import Faithfulness
 
 # ---------------------------------------------------------------------------
-# Thresholds — a metric's *aggregate* mean must meet or exceed this value.
+# Thresholds — aggregate mean must meet or exceed each value.
 # ---------------------------------------------------------------------------
 THRESHOLDS: dict[str, float] = {
     "faithfulness": 0.7,
@@ -42,12 +48,11 @@ THRESHOLDS: dict[str, float] = {
 # ---------------------------------------------------------------------------
 # Test suite
 # ---------------------------------------------------------------------------
-# Each case carries a "label" so the report can highlight expected vs actual
-# outcome.  The one "failing" case has an answer that:
-#   • Does not address the question (low answer_relevancy)
-#   • Contains claims absent from the context (low faithfulness)
-#   • Has a wrong ground-truth match (low context_precision)
-# Three passing cases vs one bad case → aggregate scores ~0.65, below threshold.
+# label="pass"  → good, grounded, relevant answer
+# label="fail"  → deliberately hallucinated / off-topic answer
+#
+# 3 passing + 1 failing → aggregate faithfulness/answer_relevancy ≈ 0.65,
+# below the 0.7 threshold, so the CI job will exit 1.
 # ---------------------------------------------------------------------------
 TEST_CASES: list[dict] = [
     # ------------------------------------------------------------------ PASS
@@ -96,11 +101,11 @@ TEST_CASES: list[dict] = [
         ),
     },
     # ------------------------------------------------------------------ FAIL  (deliberate)
-    # Answer is completely off-topic (talks about the PCB) and introduces
-    # hallucinated facts not present in the context. Expected scores:
-    #   faithfulness      ~ 0.0  (no claims grounded in context)
-    #   answer_relevancy  ~ 0.0  (answer doesn't address the question at all)
-    #   context_precision ~ 0.0  (the retrieved context isn't used)
+    # Answer is completely off-topic and introduces hallucinated facts absent
+    # from the context. Expected scores:
+    #   faithfulness      ~ 0.0  (no claim is grounded in the context)
+    #   answer_relevancy  ~ 0.0  (answer does not address the question at all)
+    #   context_precision ~ 0.0  (retrieved context is not used)
     {
         "label": "fail",
         "question": "Who founded Pakistan Tehreek-e-Insaf?",
@@ -122,20 +127,6 @@ METRIC_COLS = ["faithfulness", "answer_relevancy", "context_precision"]
 RESULTS_PATH = Path("eval_results.json")
 
 
-def _build_llm(api_key: str) -> LangchainLLMWrapper:
-    return LangchainLLMWrapper(
-        ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key)
-    )
-
-
-def _build_embeddings(api_key: str) -> LangchainEmbeddingsWrapper:
-    return LangchainEmbeddingsWrapper(
-        GoogleGenerativeAIEmbeddings(
-            model="models/gemini-embedding-001", google_api_key=api_key
-        )
-    )
-
-
 def _separator(char: str = "-", width: int = 72) -> str:
     return char * width
 
@@ -155,6 +146,22 @@ def main() -> int:
     print(f"Thresholds : {THRESHOLDS}")
     print()
 
+    # ----------------------------------------------------------------
+    # LLM: pass ChatGoogleGenerativeAI directly to evaluate() — it
+    # auto-wraps any langchain BaseLanguageModel in LangchainLLMWrapper,
+    # which is what the old-style MetricWithLLM metrics expect.
+    #
+    # Embeddings: GoogleEmbeddings satisfies BaseRagasEmbedding, which
+    # MetricWithEmbeddings.embeddings accepts.
+    #
+    # Metrics: fresh instances of the OLD Metric subclasses so that
+    # isinstance(m, ragas.metrics.base.Metric) is True.
+    # ----------------------------------------------------------------
+    genai_client = google_genai.Client(api_key=api_key)
+    langchain_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key)
+    embeddings = GoogleEmbeddings(client=genai_client, model="gemini-embedding-001")
+    metrics = [Faithfulness(), AnswerRelevancy(), ContextPrecision()]
+
     dataset = Dataset.from_dict(
         {
             "question": [t["question"] for t in TEST_CASES],
@@ -164,19 +171,17 @@ def main() -> int:
         }
     )
 
-    llm = _build_llm(api_key)
-    embeddings = _build_embeddings(api_key)
-
-    metrics = [faithfulness, answer_relevancy, context_precision]
-    for m in metrics:
-        m.llm = llm
-        if hasattr(m, "embeddings"):
-            m.embeddings = embeddings
-
-    print("Scoring with RAGAS …")
-    result = evaluate(dataset, metrics=metrics)
+    print("Scoring with RAGAS ...")
+    result = evaluate(dataset, metrics=metrics, llm=langchain_llm, embeddings=embeddings)
     scores_df = result.to_pandas()
     available_cols = [c for c in METRIC_COLS if c in scores_df.columns]
+
+    def _safe(val) -> float | None:
+        """Return float or None — NaN/Inf are not JSON-serialisable."""
+        if val is None:
+            return None
+        f = float(val)
+        return None if (math.isnan(f) or math.isinf(f)) else f
 
     # ----------------------------------------------------------------
     # Per-question report
@@ -189,13 +194,14 @@ def main() -> int:
     for i, case in enumerate(TEST_CASES):
         tag = "[EXPECTED PASS]" if case["label"] == "pass" else "[EXPECTED FAIL]"
         print(f"\n{tag}  Q{i + 1}: {case['question']}")
-        print(f"        Answer: {case['answer'][:80]}{'…' if len(case['answer']) > 80 else ''}")
+        print(f"        Answer: {case['answer'][:80]}{'...' if len(case['answer']) > 80 else ''}")
         row: dict = {"question": case["question"], "label": case["label"]}
         for col in available_cols:
-            score = float(scores_df[col].iloc[i]) if i < len(scores_df) else None
+            score = _safe(scores_df[col].iloc[i] if i < len(scores_df) else None)
             threshold = THRESHOLDS.get(col, 0.0)
             status = "PASS" if score is not None and score >= threshold else "FAIL"
-            print(f"        {col:<22} {score:.3f}  (threshold={threshold})  [{status}]")
+            score_str = f"{score:.3f}" if score is not None else "n/a"
+            print(f"        {col:<22} {score_str}  (threshold={threshold})  [{status}]")
             row[col] = score
         per_question_output.append(row)
 
@@ -210,17 +216,22 @@ def main() -> int:
     aggregate_output: dict[str, float] = {}
     failures: list[str] = []
     for col in available_cols:
-        mean = float(scores_df[col].mean())
+        mean = _safe(scores_df[col].mean())
         threshold = THRESHOLDS.get(col, 0.0)
-        status = "PASS" if mean >= threshold else "FAIL"
-        print(f"  {col:<22} {mean:.3f}  (threshold={threshold})  [{status}]")
-        aggregate_output[col] = mean
-        if mean < threshold:
+        if mean is None:
+            status = "FAIL"
+            mean_str = "n/a"
+            failures.append(f"{col}=n/a")
+        elif mean < threshold:
+            status = "FAIL"
+            mean_str = f"{mean:.3f}"
             failures.append(f"{col}={mean:.3f} < {threshold}")
+        else:
+            status = "PASS"
+            mean_str = f"{mean:.3f}"
+        print(f"  {col:<22} {mean_str}  (threshold={threshold})  [{status}]")
+        aggregate_output[col] = mean
 
-    # ----------------------------------------------------------------
-    # Persist results as JSON (uploaded as a CI artifact)
-    # ----------------------------------------------------------------
     RESULTS_PATH.write_text(
         json.dumps(
             {"aggregate": aggregate_output, "per_question": per_question_output},
