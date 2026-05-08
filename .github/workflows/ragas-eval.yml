@@ -1,0 +1,58 @@
+name: RAGAS Evaluation
+
+# Run on every push to main. Fails the job when any aggregate RAGAS metric
+# drops below its configured threshold (see eval/ci_eval.py → THRESHOLDS).
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  ragas-eval:
+    name: RAGAS Evaluation
+    runs-on: ubuntu-latest
+
+    steps:
+      # ----------------------------------------------------------------
+      # 1. Source
+      # ----------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------
+      # 2. Python toolchain — uv reads .python-version automatically
+      # ----------------------------------------------------------------
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install project dependencies
+        run: uv sync --frozen
+
+      # ----------------------------------------------------------------
+      # 3. Evaluation
+      #
+      # GOOGLE_API_KEY must be added as a repository secret:
+      #   Settings → Secrets and variables → Actions → New repository secret
+      #
+      # The script exits 0 on pass, 1 on failure. GitHub treats any non-zero
+      # exit code as a failed step, marking the whole job red.
+      # ----------------------------------------------------------------
+      - name: Run RAGAS evaluation
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: uv run python eval/ci_eval.py
+
+      # ----------------------------------------------------------------
+      # 4. Artifacts — upload the JSON results regardless of pass/fail
+      #    so you can inspect scores even when the job is red.
+      # ----------------------------------------------------------------
+      - name: Upload evaluation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ragas-eval-results
+          path: eval_results.json
+          if-no-files-found: warn
+          retention-days: 30
